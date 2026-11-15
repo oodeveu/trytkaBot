@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS voice_daily(
     guild_id INTEGER, day TEXT, user_id INTEGER, seconds INTEGER,
     PRIMARY KEY (guild_id, day, user_id)
 );
+CREATE TABLE IF NOT EXISTS voice_hub(
+    guild_id INTEGER PRIMARY KEY, channel_id INTEGER, category_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS temp_channels(
+    channel_id INTEGER PRIMARY KEY, guild_id INTEGER, owner_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS message_counts(
+    guild_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+);
 """
 )
 db.commit()
@@ -119,13 +129,104 @@ async def on_ready():
             for m in vc.members:
                 if not m.bot:
                     voice_sessions.setdefault((guild.id, m.id), now())
+    # usuń puste kanały tymczasowe pozostałe po restarcie bota
+    for (channel_id,) in db.execute("SELECT channel_id FROM temp_channels").fetchall():
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            db.execute("DELETE FROM temp_channels WHERE channel_id=?", (channel_id,))
+            db.commit()
+        else:
+            await delete_if_empty_temp(ch)
     print(f"Zalogowano jako {bot.user}")
+
+
+OWNER_PERMS = discord.PermissionOverwrite(
+    view_channel=True,
+    connect=True,
+    speak=True,
+    stream=True,
+    use_voice_activation=True,
+    priority_speaker=True,
+    mute_members=True,
+    deafen_members=True,
+    move_members=True,
+    manage_channels=True,
+    manage_permissions=True,
+    create_instant_invite=True,
+)
+
+
+async def handle_hub_join(member: discord.Member, category_id: int):
+    """Tworzy prywatny kanał dla osoby, która weszła na kanał-hub, i ją tam przenosi."""
+    guild = member.guild
+
+    # jeśli osoba ma już swój kanał - przenieś ją tam zamiast tworzyć kolejny
+    existing = db.execute(
+        "SELECT channel_id FROM temp_channels WHERE guild_id=? AND owner_id=?",
+        (guild.id, member.id),
+    ).fetchone()
+    if existing:
+        ch = guild.get_channel(existing[0])
+        if ch:
+            try:
+                await member.move_to(ch)
+            except discord.HTTPException:
+                pass
+            return
+        db.execute("DELETE FROM temp_channels WHERE channel_id=?", (existing[0],))
+        db.commit()
+
+    category = guild.get_channel(category_id)
+    try:
+        ch = await guild.create_voice_channel(
+            name=f"Kanał {member.display_name}",
+            category=category,
+            overwrites={member: OWNER_PERMS},
+            reason=f"Prywatny kanał dla {member}",
+        )
+    except discord.HTTPException as e:
+        print(f"Nie udało się utworzyć kanału: {e}")
+        return
+
+    db.execute(
+        "INSERT OR REPLACE INTO temp_channels VALUES(?,?,?)",
+        (ch.id, guild.id, member.id),
+    )
+    db.commit()
+    try:
+        await member.move_to(ch)
+    except discord.HTTPException:
+        # osoba zdążyła wyjść - nie zostawiamy pustego kanału
+        await ch.delete()
+        db.execute("DELETE FROM temp_channels WHERE channel_id=?", (ch.id,))
+        db.commit()
+
+
+async def delete_if_empty_temp(channel: discord.VoiceChannel):
+    row = db.execute(
+        "SELECT 1 FROM temp_channels WHERE channel_id=?", (channel.id,)
+    ).fetchone()
+    if row and len(channel.members) == 0:
+        try:
+            await channel.delete(reason="Pusty kanał tymczasowy")
+        except discord.HTTPException:
+            pass
+        db.execute("DELETE FROM temp_channels WHERE channel_id=?", (channel.id,))
+        db.commit()
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    db.execute("DELETE FROM temp_channels WHERE channel_id=?", (channel.id,))
+    db.commit()
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
+
+    # --- statystyki czasu na VC ---
     key = (member.guild.id, member.id)
     if before.channel is None and after.channel is not None:
         voice_sessions[key] = now()
@@ -133,6 +234,18 @@ async def on_voice_state_update(member, before, after):
         start = voice_sessions.pop(key, None)
         if start:
             add_voice_time(member.guild.id, member.id, start, now())
+
+    # --- kanały tymczasowe ---
+    if after.channel and after.channel != before.channel:
+        hub = db.execute(
+            "SELECT channel_id, category_id FROM voice_hub WHERE guild_id=?",
+            (member.guild.id,),
+        ).fetchone()
+        if hub and after.channel.id == hub[0]:
+            await handle_hub_join(member, hub[1])
+
+    if before.channel and before.channel != after.channel:
+        await delete_if_empty_temp(before.channel)
 
 
 @bot.event
@@ -191,6 +304,13 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
     await bot.process_commands(message)
+
+    db.execute(
+        """INSERT INTO message_counts(guild_id, user_id, count) VALUES(?,?,1)
+           ON CONFLICT(guild_id, user_id) DO UPDATE SET count = count + 1""",
+        (message.guild.id, message.author.id),
+    )
+    db.commit()
 
     perms = message.author.guild_permissions
     if perms.administrator or perms.manage_messages:
@@ -346,6 +466,87 @@ async def stats_setup(interaction: discord.Interaction, kanal: discord.TextChann
     db.commit()
     await interaction.response.send_message(
         f"Podsumowania będą wysyłane na {kanal.mention} codziennie o 00:00.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="stats", description="Pokazuje łączne statystyki użytkownika")
+@app_commands.describe(osoba="Użytkownik (domyślnie Ty)")
+async def stats(interaction: discord.Interaction, osoba: discord.Member | None = None):
+    member = osoba or interaction.user
+    gid = interaction.guild_id
+
+    rows = db.execute(
+        "SELECT day, seconds FROM voice_daily WHERE guild_id=? AND user_id=?",
+        (gid, member.id),
+    ).fetchall()
+    total = sum(s for _, s in rows)
+
+    # doliczamy trwającą teraz sesję
+    active = voice_sessions.get((gid, member.id))
+    if active:
+        total += int((now() - active).total_seconds())
+
+    days = len(rows)
+    avg = total // max(days, 1)
+    best = max(rows, key=lambda r: r[1]) if rows else None
+
+    ranking = db.execute(
+        "SELECT user_id FROM voice_daily WHERE guild_id=? "
+        "GROUP BY user_id ORDER BY SUM(seconds) DESC",
+        (gid,),
+    ).fetchall()
+    place = next((i for i, (uid,) in enumerate(ranking, 1) if uid == member.id), None)
+
+    msgs = db.execute(
+        "SELECT count FROM message_counts WHERE guild_id=? AND user_id=?",
+        (gid, member.id),
+    ).fetchone()
+
+    embed = discord.Embed(
+        title=f"Statystyki - {member.display_name}", color=discord.Color.blurple()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Łączny czas na VC", value=fmt_duration(total) if total else "0s")
+    embed.add_field(name="Miejsce w rankingu VC", value=f"#{place}" if place else "-")
+    embed.add_field(name="Dni aktywności na VC", value=str(days))
+    embed.add_field(name="Średnio dziennie", value=fmt_duration(avg) if total else "0s")
+    if best:
+        best_day = datetime.fromisoformat(best[0]).strftime("%d.%m.%Y")
+        embed.add_field(
+            name="Rekordowy dzień", value=f"{best_day} ({fmt_duration(best[1])})"
+        )
+    embed.add_field(name="Wiadomości", value=str(msgs[0] if msgs else 0))
+    if member.joined_at:
+        embed.add_field(
+            name="Na serwerze od", value=discord.utils.format_dt(member.joined_at, "D")
+        )
+    embed.set_footer(text="Statystyki liczone od momentu dodania bota")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="voice-setup",
+    description="Ustawia kanał, który tworzy prywatne kanały głosowe",
+)
+@app_commands.describe(
+    kanal="Kanał głosowy, na który wchodzi się, by stworzyć własny kanał",
+    kategoria="Kategoria, w której będą tworzone kanały",
+)
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def voice_setup(
+    interaction: discord.Interaction,
+    kanal: discord.VoiceChannel,
+    kategoria: discord.CategoryChannel,
+):
+    db.execute(
+        "INSERT OR REPLACE INTO voice_hub VALUES(?,?,?)",
+        (interaction.guild_id, kanal.id, kategoria.id),
+    )
+    db.commit()
+    await interaction.response.send_message(
+        f"Wejście na {kanal.mention} utworzy kanał w kategorii **{kategoria.name}**.",
         ephemeral=True,
     )
 
