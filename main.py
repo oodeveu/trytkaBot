@@ -530,19 +530,21 @@ async def leaderboard(interaction: discord.Interaction):
     gid = interaction.guild_id
     caller_id = interaction.user.id
 
-    # Pobieramy sumę sekund z bazy dla każdego użytkownika na tym serwerze
+    # Pobieramy sumę sekund z bazy i konwertujemy user_id na int
     rows = db.execute(
         "SELECT user_id, SUM(seconds) as total_seconds FROM voice_daily WHERE guild_id=? GROUP BY user_id",
         (gid,),
     ).fetchall()
 
-    # Tworzymy słownik/mapę, aby łatwo dodać aktywne sesje VC
-    user_totals = {row[0]: row[1] for row in rows}
+    # Słownik z zabezpieczeniem, że klucz to zawsze int
+    user_totals = {int(row[0]): row[1] for row in rows}
 
+    # Doliczamy aktywne sesje z uwzględnieniem konwersji na int
     for (g_id, u_id), start_time in voice_sessions.items():
         if g_id == gid:
             active_secs = int((now() - start_time).total_seconds())
-            user_totals[u_id] = user_totals.get(u_id, 0) + active_secs
+            u_id_int = int(u_id)
+            user_totals[u_id_int] = user_totals.get(u_id_int, 0) + active_secs
 
     # Sortujemy użytkowników malejąco według czasu
     sorted_ranking = sorted(user_totals.items(), key=lambda item: item[1], reverse=True)
@@ -566,14 +568,13 @@ async def leaderboard(interaction: discord.Interaction):
 
         for index, (uid, total_secs) in enumerate(top_10, 1):
             prefix = medals[index - 1] if index <= 3 else f"`#{index}.`"
-            # Próbujemy pobrać członka z cache/guild, żeby wyświetlić ładną nazwę
             member = interaction.guild.get_member(uid)
-            name = member.mention if member else f"<@id:{uid}>"
+            name = member.mention if member else f"<@!{uid}>"
             desc_lines.append(f"{prefix} {name} — **{fmt_duration(total_secs)}**")
 
         embed.description = "\n".join(desc_lines)
 
-    # Jeśli osoba wywołująca komendę jest poza top 10, dopisujemy jej pozycję w stopce lub podsumowaniu
+    # Jeśli osoba wywołująca komendę jest poza top 10, dopisujemy jej pozycję w stopce
     if caller_place and caller_place > 10:
         caller_secs = user_totals.get(caller_id, 0)
         embed.set_footer(text=f"Twoje miejsce: #{caller_place} ({fmt_duration(caller_secs)})")
