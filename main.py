@@ -525,6 +525,63 @@ async def stats(interaction: discord.Interaction, osoba: discord.Member | None =
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="leaderboard", description="Pokazuje ranking użytkowników pod względem czasu spędzonego na VC")
+async def leaderboard(interaction: discord.Interaction):
+    gid = interaction.guild_id
+    caller_id = interaction.user.id
+
+    # Pobieramy sumę sekund z bazy dla każdego użytkownika na tym serwerze
+    rows = db.execute(
+        "SELECT user_id, SUM(seconds) as total_seconds FROM voice_daily WHERE guild_id=? GROUP BY user_id",
+        (gid,),
+    ).fetchall()
+
+    # Tworzymy słownik/mapę, aby łatwo dodać aktywne sesje VC
+    user_totals = {row[0]: row[1] for row in rows}
+
+    for (g_id, u_id), start_time in voice_sessions.items():
+        if g_id == gid:
+            active_secs = int((now() - start_time).total_seconds())
+            user_totals[u_id] = user_totals.get(u_id, 0) + active_secs
+
+    # Sortujemy użytkowników malejąco według czasu
+    sorted_ranking = sorted(user_totals.items(), key=lambda item: item[1], reverse=True)
+
+    # Szukamy miejsca osoby wywołującej komendę
+    caller_place = next((i for i, (uid, _) in enumerate(sorted_ranking, 1) if uid == caller_id), None)
+
+    # Bierzemy top 10
+    top_10 = sorted_ranking[:10]
+
+    embed = discord.Embed(
+        title="🏆 Ranking aktywności na VC",
+        color=discord.Color.gold()
+    )
+
+    if not top_10:
+        embed.description = "Brak danych o aktywności na tym serwerze."
+    else:
+        desc_lines = []
+        medals = ["🥇", "🥈", "🥉"]
+
+        for index, (uid, total_secs) in enumerate(top_10, 1):
+            prefix = medals[index - 1] if index <= 3 else f"`#{index}.`"
+            # Próbujemy pobrać członka z cache/guild, żeby wyświetlić ładną nazwę
+            member = interaction.guild.get_member(uid)
+            name = member.mention if member else f"<@id:{uid}>"
+            desc_lines.append(f"{prefix} {name} — **{fmt_duration(total_secs)}**")
+
+        embed.description = "\n".join(desc_lines)
+
+    # Jeśli osoba wywołująca komendę jest poza top 10, dopisujemy jej pozycję w stopce lub podsumowaniu
+    if caller_place and caller_place > 10:
+        caller_secs = user_totals.get(caller_id, 0)
+        embed.set_footer(text=f"Twoje miejsce: #{caller_place} ({fmt_duration(caller_secs)})")
+    else:
+        embed.set_footer(text="Statystyki liczone od momentu dodania bota")
+
+    await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(
     name="voice-setup",
     description="Ustawia kanał, który tworzy prywatne kanały głosowe",
