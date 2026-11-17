@@ -9,9 +9,31 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+from google import genai
+from google.genai import types
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 TZ = ZoneInfo("Europe/Warsaw")
+
+# ---------- LLM CHAT ----------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+AI_CHAT_CHANNEL = os.getenv("AI_CHAT_CHANNEL")
+GEMINI_MODEL="gemini-2.5-flash"
+
+AI_CHAT_CHANNEL_ID = int(AI_CHAT_CHANNEL) if AI_CHAT_CHANNEL else None
+AI_HISTORY_LEN = 10
+AI_COOLDOWN = 3
+AI_SYSTEM_PROMPT = (
+    "Jesteś pomocnym asystentem na serwerze Discord. Odpowiadaj po polsku, "
+    "chyba że użytkownik pisze w innym języku. Pisz zwięźle i konkretnie."
+)
+
+gemini = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+ai_history: dict[tuple[int, int], deque] = defaultdict(
+    lambda: deque(maxlen=AI_HISTORY_LEN * 2)
+)
+ai_last_use: dict[int, float] = {}
 
 # ---------- KONFIGURACJA ANTY SPAMU ----------
 SPAM_MSG_LIMIT = 5          # tyle wiadomości...
@@ -21,9 +43,11 @@ SPAM_DUP_WINDOW = 15        # ...w tylu sekundach
 SPAM_MAX_MENTIONS = 5       # max wzmianek w jednej wiadomości
 SPAM_TIMEOUT_MIN = 5        # czas wyciszenia (minuty)
 
+
 # ---------- BAZA DANYCH ----------
 db = sqlite3.connect("bot.db")
 db.executescript(
+
     """
 CREATE TABLE IF NOT EXISTS verifications(
     message_id INTEGER PRIMARY KEY,
@@ -363,6 +387,84 @@ async def on_message(message: discord.Message):
             delete_after=10,
         )
 
+# ---------- LLM CHAT ----------
+def split_message(text: str, limit: int = 2000) -> list[str]:
+    """Dzieli długą odpowiedź na kawałki mieszczące się w limicie Discorda."""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+async def ask_gemini(key: tuple[int, int], user_text: str) -> str:
+    history = ai_history[key]
+    user_content = types.Content(role="user", parts=[types.Part(text=user_text)])
+
+    resp = await gemini.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=list(history) + [user_content],
+        config=types.GenerateContentConfig(
+            system_instruction=AI_SYSTEM_PROMPT,
+            max_output_tokens=1024,
+            temperature=0.8,
+        ),
+    )
+    answer = (resp.text or "").strip()
+    if answer:
+        history.append(user_content)
+        history.append(types.Content(role="model", parts=[types.Part(text=answer)]))
+    return answer
+
+
+@bot.listen("on_message")
+async def ai_chat_listener(message: discord.Message):
+    if message.author.bot or not message.guild or gemini is None:
+        return
+    if message.channel.id != AI_CHAT_CHANNEL_ID:
+        return
+    text = message.content.strip()
+    if not text or text.startswith(bot.command_prefix):
+        return
+
+    t = now().timestamp()
+    if t - ai_last_use.get(message.author.id, 0) < AI_COOLDOWN:
+        return
+    ai_last_use[message.author.id] = t
+
+    key = (message.channel.id, message.author.id)
+    no_pings = discord.AllowedMentions.none()
+    async with message.channel.typing():
+        try:
+            answer = await ask_gemini(key, text)
+        except Exception as e:
+            print(f"Błąd Gemini: {e}")
+            await message.reply(
+                "Wystąpił błąd przy łączeniu z AI, spróbuj za chwilę.",
+                mention_author=False,
+            )
+            return
+
+    if not answer:
+        await message.reply(
+            "Nie udało mi się wygenerować odpowiedzi (możliwy filtr treści).",
+            mention_author=False,
+        )
+        return
+
+    for i, chunk in enumerate(split_message(answer)):
+        if i == 0:
+            await message.reply(chunk, mention_author=False, allowed_mentions=no_pings)
+        else:
+            await message.channel.send(chunk, allowed_mentions=no_pings)
+
 
 # ---------- KOMENDY ----------
 @bot.tree.command(
@@ -668,6 +770,10 @@ async def daily_summary():
 async def before_daily_summary():
     await bot.wait_until_ready()
 
+@bot.tree.command(name="ai-reset", description="Resetuje Twoją historię rozmowy z AI")
+async def ai_reset(interaction: discord.Interaction):
+    ai_history.pop((interaction.channel_id, interaction.user.id), None)
+    await interaction.response.send_message("Historia rozmowy z AI wyczyszczona.", ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
