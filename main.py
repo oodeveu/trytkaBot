@@ -29,7 +29,14 @@ AI_SYSTEM_PROMPT = (
     "chyba że użytkownik pisze w innym języku. Pisz zwięźle i konkretnie."
 )
 
-gemini = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+gemini = (
+    genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
+    if GEMINI_API_KEY
+    else None
+)
 ai_history: dict[tuple[int, int], deque] = defaultdict(
     lambda: deque(maxlen=AI_HISTORY_LEN * 2)
 )
