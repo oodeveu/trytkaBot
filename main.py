@@ -19,7 +19,7 @@ TZ = ZoneInfo("Europe/Warsaw")
 # ---------- LLM CHAT ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 AI_CHAT_CHANNEL = os.getenv("AI_CHAT_CHANNEL")
-GEMINI_MODEL="gemini-2.5-flash-lite"
+GEMINI_MODEL="gemini-3.8-flash"
 
 AI_CHAT_CHANNEL_ID = int(AI_CHAT_CHANNEL) if AI_CHAT_CHANNEL else None
 AI_HISTORY_LEN = 10
