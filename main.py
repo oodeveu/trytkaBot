@@ -19,7 +19,7 @@ TZ = ZoneInfo("Europe/Warsaw")
 # ---------- LLM CHAT ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 AI_CHAT_CHANNEL = os.getenv("AI_CHAT_CHANNEL")
-GEMINI_MODEL="gemini-3.8-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 AI_CHAT_CHANNEL_ID = int(AI_CHAT_CHANNEL) if AI_CHAT_CHANNEL else None
 AI_HISTORY_LEN = 10
@@ -50,18 +50,17 @@ SPAM_DUP_WINDOW = 15        # ...w tylu sekundach
 SPAM_MAX_MENTIONS = 5       # max wzmianek w jednej wiadomości
 SPAM_TIMEOUT_MIN = 5        # czas wyciszenia (minuty)
 
-
 # ---------- KOMUNIZACJA NICKÓW ----------
 COMRADE_ROLE_FEMALE = "dziewczyna"   # nazwa rangi (wielkość liter bez znaczenia)
 COMRADE_PREFIX_M = "Towarzysz"
 COMRADE_PREFIX_F = "Towarzyszka"
 COMRADE_PREFIXES = (f"{COMRADE_PREFIX_F} ", f"{COMRADE_PREFIX_M} ")
+COMRADE_SKIP_BOTS = True             # czy pomijać boty przy zmianie wszystkim
 
 
 # ---------- BAZA DANYCH ----------
 db = sqlite3.connect("bot.db")
 db.executescript(
-
     """
 CREATE TABLE IF NOT EXISTS verifications(
     message_id INTEGER PRIMARY KEY,
@@ -120,6 +119,8 @@ def fmt_duration(seconds: int) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
+
+# ---------- KOMUNIZACJA: FUNKCJE POMOCNICZE ----------
 def strip_comrade(name: str) -> str:
     for p in COMRADE_PREFIXES:
         if name.startswith(p):
@@ -127,12 +128,32 @@ def strip_comrade(name: str) -> str:
     return name
 
 
-def can_edit_nick(interaction: discord.Interaction, member: discord.Member) -> bool:
-    """Własny nick zawsze, cudzy tylko z uprawnieniem Manage Nicknames."""
-    return (
-        member.id == interaction.user.id
-        or interaction.user.guild_permissions.manage_nicknames
-    )
+def is_female(member: discord.Member) -> bool:
+    return any(r.name.lower() == COMRADE_ROLE_FEMALE for r in member.roles)
+
+
+async def set_nick(member: discord.Member, nick: str | None, reason: str) -> str:
+    """Zwraca: 'ok', 'skip' (brak uprawnień bota / właściciel) albo 'error'."""
+    try:
+        await member.edit(nick=nick, reason=reason)
+        return "ok"
+    except discord.Forbidden:
+        return "skip"
+    except discord.HTTPException as e:
+        print(f"Błąd zmiany nicku {member}: {e}")
+        return "error"
+
+
+def comrade_targets(
+    interaction: discord.Interaction, osoba: discord.Member | None
+) -> list[discord.Member]:
+    if osoba:
+        return [osoba]
+    members = interaction.guild.members
+    if COMRADE_SKIP_BOTS:
+        members = [m for m in members if not m.bot]
+    return list(members)
+
 
 # ---------- STATYSTYKI VC: ZAPIS CZASU ----------
 def add_voice_time(guild_id: int, user_id: int, start: datetime, end: datetime):
@@ -169,6 +190,7 @@ def flush_active_sessions():
 @bot.event
 async def setup_hook():
     daily_summary.start()
+    await bot.tree.sync()  # rejestracja komend slash
 
 
 @bot.event
@@ -412,6 +434,7 @@ async def on_message(message: discord.Message):
             "Wykryto spam, ale bot nie ma uprawnień (Moderate Members / Manage Messages).",
             delete_after=10,
         )
+
 
 # ---------- LLM CHAT ----------
 def split_message(text: str, limit: int = 2000) -> list[str]:
@@ -711,6 +734,7 @@ async def leaderboard(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
+
 @bot.tree.command(
     name="voice-setup",
     description="Ustawia kanał, który tworzy prywatne kanały głosowe",
@@ -735,6 +759,89 @@ async def voice_setup(
         f"Wejście na {kanal.mention} utworzy kanał w kategorii **{kategoria.name}**.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(
+    name="komunizuj",
+    description="Dodaje przedrostek Towarzysz/Towarzyszka do nicku (domyślnie wszystkim)",
+)
+@app_commands.describe(osoba="Tylko ta osoba (puste = wszyscy na serwerze)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_nicknames=True)
+@app_commands.checks.has_permissions(manage_nicknames=True)
+async def komunizuj(interaction: discord.Interaction, osoba: discord.Member | None = None):
+    await interaction.response.defer()  # masowa zmiana trwa dłużej niż 3 s
+
+    targets = comrade_targets(interaction, osoba)
+    ok = skipped = errors = 0
+    reason = f"/komunizuj przez {interaction.user}"
+
+    for member in targets:
+        prefix = COMRADE_PREFIX_F if is_female(member) else COMRADE_PREFIX_M
+        base = strip_comrade(member.display_name)  # bez podwójnego przedrostka
+        new_nick = f"{prefix} {base}"[:32]         # limit Discorda: 32 znaki
+
+        if member.nick == new_nick:                # już ma poprawny nick
+            continue
+
+        result = await set_nick(member, new_nick, reason)
+        if result == "ok":
+            ok += 1
+        elif result == "skip":
+            skipped += 1
+        else:
+            errors += 1
+
+    await interaction.followup.send(
+        f"☭ Skomunizowano: **{ok}**. "
+        f"Pominięto (brak uprawnień bota / właściciel / wyższa ranga): **{skipped}**. "
+        f"Błędy: **{errors}**."
+    )
+
+
+@bot.tree.command(
+    name="odkomunizuj",
+    description="Usuwa przedrostek Towarzysz/Towarzyszka z nicku (domyślnie wszystkim)",
+)
+@app_commands.describe(osoba="Tylko ta osoba (puste = wszyscy na serwerze)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_nicknames=True)
+@app_commands.checks.has_permissions(manage_nicknames=True)
+async def odkomunizuj(interaction: discord.Interaction, osoba: discord.Member | None = None):
+    await interaction.response.defer()
+
+    targets = comrade_targets(interaction, osoba)
+    ok = skipped = errors = 0
+    reason = f"/odkomunizuj przez {interaction.user}"
+
+    for member in targets:
+        # patrzymy tylko na nick serwerowy, żeby nie ruszać nazw globalnych
+        if not member.nick:
+            continue
+        stripped = strip_comrade(member.nick)
+        if stripped == member.nick:                # nie miał przedrostka
+            continue
+
+        new_nick = stripped or None                # pusty -> brak nicku na serwerze
+        result = await set_nick(member, new_nick, reason)
+        if result == "ok":
+            ok += 1
+        elif result == "skip":
+            skipped += 1
+        else:
+            errors += 1
+
+    await interaction.followup.send(
+        f"Odkomunizowano: **{ok}**. "
+        f"Pominięto (brak uprawnień bota / właściciel / wyższa ranga): **{skipped}**. "
+        f"Błędy: **{errors}**."
+    )
+
+
+@bot.tree.command(name="ai-reset", description="Resetuje Twoją historię rozmowy z AI")
+async def ai_reset(interaction: discord.Interaction):
+    ai_history.pop((interaction.channel_id, interaction.user.id), None)
+    await interaction.response.send_message("Historia rozmowy z AI wyczyszczona.", ephemeral=True)
 
 
 @bot.tree.error
@@ -796,85 +903,6 @@ async def daily_summary():
 async def before_daily_summary():
     await bot.wait_until_ready()
 
-@bot.tree.command(name="ai-reset", description="Resetuje Twoją historię rozmowy z AI")
-async def ai_reset(interaction: discord.Interaction):
-    ai_history.pop((interaction.channel_id, interaction.user.id), None)
-    await interaction.response.send_message("Historia rozmowy z AI wyczyszczona.", ephemeral=True)
-
-@bot.tree.command(
-    name="komunizuj",
-    description="Dodaje przedrostek Towarzysz/Towarzyszka do nicku",
-)
-@app_commands.describe(osoba="Kogo uskuteczniamy (domyślnie Ty)")
-@app_commands.guild_only()
-async def komunizuj(interaction: discord.Interaction, osoba: discord.Member | None = None):
-    member = osoba or interaction.user
-    if not can_edit_nick(interaction, member):
-        return await interaction.response.send_message(
-            "Nie masz uprawnień do zmiany cudzych nicków.", ephemeral=True
-        )
-
-    is_female = any(r.name.lower() == COMRADE_ROLE_FEMALE for r in member.roles)
-    prefix = COMRADE_PREFIX_F if is_female else COMRADE_PREFIX_M
-
-    base = strip_comrade(member.display_name)  # bez podwójnego przedrostka
-    new_nick = f"{prefix} {base}"[:32]         # limit Discorda: 32 znaki
-
-    try:
-        await member.edit(nick=new_nick, reason=f"/komunizuj przez {interaction.user}")
-    except discord.Forbidden:
-        return await interaction.response.send_message(
-            "Nie mogę zmienić tego nicku (ranga wyższa od bota, właściciel serwera "
-            "albo brak uprawnienia Manage Nicknames).",
-            ephemeral=True,
-        )
-    except discord.HTTPException as e:
-        return await interaction.response.send_message(
-            f"Nie udało się zmienić nicku: {e}", ephemeral=True
-        )
-
-    await interaction.response.send_message(
-        f"{member.mention} został(a) {'Towarzyszką' if is_female else 'Towarzyszem'}! ☭"
-    )
-
-
-@bot.tree.command(
-    name="odkomunizuj",
-    description="Usuwa przedrostek Towarzysz/Towarzyszka z nicku",
-)
-@app_commands.describe(osoba="Kogo odkomunizować (domyślnie Ty)")
-@app_commands.guild_only()
-async def odkomunizuj(interaction: discord.Interaction, osoba: discord.Member | None = None):
-    member = osoba or interaction.user
-    if not can_edit_nick(interaction, member):
-        return await interaction.response.send_message(
-            "Nie masz uprawnień do zmiany cudzych nicków.", ephemeral=True
-        )
-
-    current = member.display_name
-    stripped = strip_comrade(current)
-    if stripped == current:
-        return await interaction.response.send_message(
-            "Ta osoba nie ma przedrostka Towarzysz/Towarzyszka.", ephemeral=True
-        )
-
-    # jeśli po usunięciu zostaje nazwa konta - wracamy do braku nicku na serwerze
-    new_nick = None if stripped in (member.name, member.global_name) else stripped
-
-    try:
-        await member.edit(nick=new_nick, reason=f"/odkomunizuj przez {interaction.user}")
-    except discord.Forbidden:
-        return await interaction.response.send_message(
-            "Nie mogę zmienić tego nicku (ranga wyższa od bota, właściciel serwera "
-            "albo brak uprawnienia Manage Nicknames).",
-            ephemeral=True,
-        )
-    except discord.HTTPException as e:
-        return await interaction.response.send_message(
-            f"Nie udało się zmienić nicku: {e}", ephemeral=True
-        )
-
-    await interaction.response.send_message(f"{member.mention} został(a) odkomunizowany(a).")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
